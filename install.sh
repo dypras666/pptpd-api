@@ -54,6 +54,7 @@ chmod +x /etc/network/if-pre-up.d/iptables
 cat > /root/pptp_api.py << EOL
 $(cat << 'END_PYTHON'
 import os
+import json
 import random
 import string
 import subprocess
@@ -67,6 +68,7 @@ BASE_IP = "10.0.0.0/24"
 CLIENT_START = 100
 PORT_RANGE = (6000, 7000)
 EXCLUDED_PORTS = {80, 443, 21, 22, 25, 53}
+PORT_MAPPINGS_FILE = '/root/port_mappings.json'
 
 def get_next_ip():
     """Generate next available IP address"""
@@ -105,14 +107,26 @@ def get_used_ports():
     """Get list of used ports"""
     used_ports = set()
     try:
-        with open('/etc/iptables.rules', 'r') as f:
-            for line in f:
-                if '--dport' in line:
-                    port = int(line.split('--dport')[1].split()[0])
-                    used_ports.add(port)
-    except FileNotFoundError:
+        with open(PORT_MAPPINGS_FILE, 'r') as f:
+            mappings = json.load(f)
+            for mapping in mappings.values():
+                used_ports.add(mapping['backend_port'])
+    except (FileNotFoundError, json.JSONDecodeError):
         pass
     return used_ports
+
+def load_port_mappings():
+    """Load port mappings from file"""
+    try:
+        with open(PORT_MAPPINGS_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_port_mappings(mappings):
+    """Save port mappings to file"""
+    with open(PORT_MAPPINGS_FILE, 'w') as f:
+        json.dump(mappings, f, indent=4)
 
 @app.route('/api/client', methods=['POST'])
 def add_client():
@@ -120,14 +134,18 @@ def add_client():
     data = request.json
     username = data.get('username')
     password = data.get('password')
-    callback_ip = data.get('callback_ip')
+    destination_ip = data.get('destination_ip')  # IP tujuan (IP VPN client)
+    requested_port = data.get('port')  # Port yang diminta
     
-    if not all([username, password, callback_ip]):
+    if not all([username, password, destination_ip, requested_port]):
         return jsonify({'error': 'Missing required fields'}), 400
+    
+    if not isinstance(requested_port, int):
+        return jsonify({'error': 'Port must be a number'}), 400
     
     try:
         client_ip = get_next_ip()
-        forward_port = get_random_port()
+        backend_port = get_random_port()  # Generate random port (6000-7000)
         
         # Add client to chap-secrets
         with open('/etc/ppp/chap-secrets', 'a') as f:
@@ -136,18 +154,28 @@ def add_client():
         # Add port forwarding rule
         subprocess.run([
             'iptables', '-t', 'nat', '-A', 'PREROUTING',
-            '-p', 'tcp', '--dport', str(forward_port),
-            '-j', 'DNAT', '--to', f'{callback_ip}'
+            '-p', 'tcp', '--dport', str(backend_port),
+            '-j', 'DNAT', '--to', f'{destination_ip}:{requested_port}'
         ], check=True)
         
         # Save iptables rules
         subprocess.run(['iptables-save', '>', '/etc/iptables.rules'], shell=True, check=True)
         
+        # Update port mappings
+        mappings = load_port_mappings()
+        mappings[str(requested_port)] = {
+            'backend_port': backend_port,
+            'username': username,
+            'destination_ip': destination_ip
+        }
+        save_port_mappings(mappings)
+        
         return jsonify({
             'username': username,
             'client_ip': client_ip,
-            'forward_port': forward_port,
-            'callback_ip': callback_ip
+            'requested_port': requested_port,
+            'backend_port': backend_port,
+            'destination_ip': destination_ip
         })
         
     except Exception as e:
@@ -165,11 +193,39 @@ def remove_client(username):
                 if not line.startswith(f'"{username}"'):
                     f.write(line)
         
-        # Remove port forwarding rules
+        # Remove port mappings for this user
+        mappings = load_port_mappings()
+        new_mappings = {
+            port: mapping for port, mapping in mappings.items()
+            if mapping['username'] != username
+        }
+        save_port_mappings(new_mappings)
+        
+        # Rebuild iptables rules
+        subprocess.run(['iptables', '-t', 'nat', '-F'], check=True)  # Clear nat rules
+        subprocess.run(['iptables', '-t', 'nat', '-A', 'POSTROUTING', '-o', 'eth0', '-j', 'MASQUERADE'], check=True)
+        
+        # Recreate port forwarding rules
+        for port, mapping in new_mappings.items():
+            subprocess.run([
+                'iptables', '-t', 'nat', '-A', 'PREROUTING',
+                '-p', 'tcp', '--dport', str(mapping['backend_port']),
+                '-j', 'DNAT', '--to', f"{mapping['destination_ip']}:{port}"
+            ], check=True)
+        
         subprocess.run(['iptables-save', '>', '/etc/iptables.rules'], shell=True, check=True)
         
         return jsonify({'message': 'Client removed successfully'})
         
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/mappings', methods=['GET'])
+def get_mappings():
+    """Get all port mappings"""
+    try:
+        mappings = load_port_mappings()
+        return jsonify(mappings)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -178,9 +234,6 @@ if __name__ == '__main__':
 END_PYTHON
 )
 EOL
-
-# Start PPTPD service
-systemctl restart pptpd
 
 # Create systemd service for API
 cat > /etc/systemd/system/pptp-api.service << EOL
